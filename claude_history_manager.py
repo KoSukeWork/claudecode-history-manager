@@ -629,6 +629,12 @@ class ClaudeHistoryGUI:
         self._sorting_in_progress = False  # 防止重复触发排序
         self._sort_block_timer = None  # 排序阻塞定时器
 
+        # 分页相关
+        self.page_size = 50  # 每页显示50个对话
+        self.current_page = 1
+        self.total_pages = 1
+        self.filtered_conversations = []  # 当前筛选后的对话列表
+
         # 创建Token计算器
         self.token_calculator = TokenCalculator()
 
@@ -649,6 +655,9 @@ class ClaudeHistoryGUI:
 
         # 设置窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # 绑定键盘快捷键
+        self._setup_keyboard_shortcuts()
 
         # 加载数据
         self._load_projects()
@@ -684,6 +693,17 @@ class ClaudeHistoryGUI:
         # 左侧面板 - 项目和对话列表
         left_frame = ttk.Frame(main_paned)
         main_paned.add(left_frame, weight=1)
+
+        # 统计面板（顶部）
+        stats_frame = ttk.LabelFrame(left_frame, text="项目统计", padding=5)
+        stats_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # 统计信息显示
+        self.stats_text = tk.Text(stats_frame, height=4, wrap=tk.WORD, font=("Consolas", 9))
+        self.stats_text.pack(fill=tk.X, padx=2, pady=2)
+
+        # 配置统计文本样式
+        self.stats_text.config(state=tk.DISABLED, bg='#f0f0f0')
 
         # 项目选择
         project_frame = ttk.LabelFrame(left_frame, text="项目", padding=8)
@@ -742,6 +762,47 @@ class ClaudeHistoryGUI:
         self.conversation_tree.bind('<<TreeviewSelect>>', self._on_conversation_select)
         self.conversation_tree.bind('<Double-1>', self._on_conversation_double_click)
         self.conversation_tree.bind('<Button-3>', self._show_context_menu)
+
+        # 分页控制面板
+        pagination_frame = ttk.Frame(list_frame)
+        pagination_frame.pack(fill=tk.X, pady=(5, 0))
+
+        # 分页信息标签
+        self.page_info_label = ttk.Label(pagination_frame, text="第 1 页，共 1 页")
+        self.page_info_label.pack(side=tk.LEFT, padx=5)
+
+        # 分页按钮
+        pagination_buttons = ttk.Frame(pagination_frame)
+        pagination_buttons.pack(side=tk.RIGHT)
+
+        self.first_page_btn = ttk.Button(pagination_buttons, text="首页", command=self._go_to_first_page, width=6)
+        self.first_page_btn.pack(side=tk.LEFT, padx=1)
+
+        self.prev_page_btn = ttk.Button(pagination_buttons, text="上一页", command=self._go_to_prev_page, width=8)
+        self.prev_page_btn.pack(side=tk.LEFT, padx=1)
+
+        # 页码输入框
+        ttk.Label(pagination_buttons, text="跳转到").pack(side=tk.LEFT, padx=(10, 2))
+        self.page_var = tk.StringVar(value="1")
+        self.page_entry = ttk.Entry(pagination_buttons, textvariable=self.page_var, width=5)
+        self.page_entry.pack(side=tk.LEFT, padx=1)
+        self.page_entry.bind('<Return>', self._jump_to_page)
+        ttk.Label(pagination_buttons, text="页").pack(side=tk.LEFT, padx=1)
+
+        self.next_page_btn = ttk.Button(pagination_buttons, text="下一页", command=self._go_to_next_page, width=8)
+        self.next_page_btn.pack(side=tk.LEFT, padx=1)
+
+        self.last_page_btn = ttk.Button(pagination_buttons, text="末页", command=self._go_to_last_page, width=6)
+        self.last_page_btn.pack(side=tk.LEFT, padx=1)
+
+        # 每页显示数量选择
+        ttk.Label(pagination_buttons, text="每页显示").pack(side=tk.LEFT, padx=(10, 2))
+        self.page_size_var = tk.StringVar(value="50")
+        page_size_combo = ttk.Combobox(pagination_buttons, textvariable=self.page_size_var,
+                                      values=["20", "50", "100", "200"], state="readonly", width=6)
+        page_size_combo.pack(side=tk.LEFT, padx=1)
+        page_size_combo.bind('<<ComboboxSelected>>', self._on_page_size_change)
+        ttk.Label(pagination_buttons, text="条").pack(side=tk.LEFT, padx=1)
 
         # 右键菜单
         self.context_menu = tk.Menu(self.root, tearoff=0)
@@ -812,6 +873,16 @@ class ClaudeHistoryGUI:
         ttk.Button(button_frame, text="删除对话", command=self._delete_conversation).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="刷新项目", command=self._load_projects).pack(side=tk.RIGHT, padx=5)
 
+        # 进度条框架
+        progress_frame = ttk.Frame(self.root)
+        progress_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
+
+        # 进度条（默认隐藏）
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var,
+                                          mode='determinate', length=200)
+        self.progress_label = ttk.Label(progress_frame, text="")
+
         # 状态栏
         self.status_bar = ttk.Label(self.root, text="就绪", relief=tk.SUNKEN)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -822,22 +893,25 @@ class ClaudeHistoryGUI:
             messagebox.showerror("错误", f"Projects目录不存在: {self.projects_path}")
             return
 
+        # 显示进度条
+        self._show_progress("正在扫描项目目录...")
         self.status_bar.config(text="正在加载项目数据...")
-        self.root.update()
 
         # 在后台线程中加载数据
         threading.Thread(target=self._load_projects_thread, daemon=True).start()
 
     def _load_projects_thread(self):
-        """后台线程加载项目数据"""
+        """后台线程加载项目数据（带进度条）"""
         try:
             start_time = time.time()
             self.projects_data = {}
 
             # 获取所有项目目录
+            self.root.after(0, lambda: self._update_progress(10, "正在发现项目目录..."))
             project_dirs = [d for d in self.projects_path.iterdir() if d.is_dir()]
 
             if not project_dirs:
+                self.root.after(0, lambda: self._hide_progress())
                 self.root.after(0, lambda: self._update_projects_ui())
                 return
 
@@ -845,6 +919,7 @@ class ClaudeHistoryGUI:
             max_workers = min(4, len(project_dirs))  # 限制最大并发数
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # 提交所有项目分析任务
+                self.root.after(0, lambda: self._update_progress(20, f"发现 {len(project_dirs)} 个项目，开始分析..."))
                 future_to_project = {
                     executor.submit(self._analyze_project_concurrent, project_dir): project_dir
                     for project_dir in project_dirs
@@ -852,6 +927,7 @@ class ClaudeHistoryGUI:
 
                 # 收集结果
                 completed_count = 0
+                total_projects = len(project_dirs)
                 for future in concurrent.futures.as_completed(future_to_project):
                     project_dir = future_to_project[future]
                     try:
@@ -861,19 +937,22 @@ class ClaudeHistoryGUI:
                         completed_count += 1
 
                         # 更新进度
-                        progress = (completed_count / len(project_dirs)) * 100
-                        self.root.after(0, lambda p=progress: self.status_bar.config(
-                            text=f"正在加载项目... {completed_count}/{len(project_dirs)} ({p:.0f}%)"
+                        progress = 20 + (completed_count / total_projects) * 70  # 20%-90%
+                        self.root.after(0, lambda p=progress, c=completed_count, t=total_projects: self._update_progress(
+                            p, f"正在分析项目... {c}/{t} ({p:.0f}%)"
                         ))
 
                     except Exception as e:
                         print(f"分析项目 {project_dir.name} 时出错: {e}")
 
             # 更新UI
+            self.root.after(0, lambda: self._update_progress(95, "正在更新界面..."))
             elapsed_time = time.time() - start_time
             self.root.after(0, lambda: self._update_projects_ui_with_stats(elapsed_time))
+            self.root.after(0, lambda: self._hide_progress())
 
         except Exception as e:
+            self.root.after(0, lambda: self._hide_progress())
             self.root.after(0, lambda: messagebox.showerror("错误", f"加载项目失败: {e}"))
             self.root.after(0, lambda: self.status_bar.config(text="加载失败"))
 
@@ -1073,10 +1152,15 @@ class ClaudeHistoryGUI:
 
         self.current_project = project_name
         self.current_conversations = self.projects_data[project_name]
+        self.filtered_conversations = self.current_conversations.copy()  # 重置筛选列表
 
         # 重置排序状态并默认按修改时间降序排列
         self.sort_column = "修改时间"
         self.sort_reverse = True  # 降序，最新的在前
+
+        # 重置分页
+        self.current_page = 1
+        self._update_pagination()
 
         # 更新对话列表
         self._update_conversation_list()
@@ -1085,10 +1169,43 @@ class ClaudeHistoryGUI:
         total_tokens = sum(conv.get('total_tokens', 0) for conv in self.current_conversations)
         total_tokens_str = self.token_calculator.format_tokens(total_tokens)
 
+        # 更新统计显示
+        self._update_stats_display()
+
         self.status_bar.config(text=f"项目: {project_name} - {len(self.current_conversations)} 个对话, 总计 {total_tokens_str} tokens")
 
+    def _update_stats_display(self):
+        """更新统计显示面板"""
+        if not self.current_conversations:
+            stats_text = "📊 暂无数据"
+        else:
+            # 计算统计数据
+            total_conversations = len(self.current_conversations)
+            total_tokens = sum(conv.get('total_tokens', 0) for conv in self.current_conversations)
+            total_messages = sum(conv.get('message_count', 0) for conv in self.current_conversations)
+            total_file_size = sum(conv.get('file_size', 0) for conv in self.current_conversations)
+
+            # 计算平均值
+            avg_tokens = total_tokens / total_conversations if total_conversations > 0 else 0
+            avg_messages = total_messages / total_conversations if total_conversations > 0 else 0
+
+            # 格式化显示
+            stats_text = f"📊 项目统计\n"
+            stats_text += f"对话数: {total_conversations} | 消息数: {total_messages} | Token数: {self.token_calculator.format_tokens(total_tokens)}\n"
+            stats_text += f"平均: {avg_messages:.1f} 消息/对话 | {self.token_calculator.format_tokens(avg_tokens)}/对话 | {self._format_file_size(total_file_size/total_conversations)}/对话"
+
+            # 添加当前筛选信息
+            if len(self.filtered_conversations) != len(self.current_conversations):
+                stats_text += f"\n当前显示: {len(self.filtered_conversations)}/{total_conversations} 个对话"
+
+        # 更新统计文本
+        self.stats_text.config(state=tk.NORMAL)
+        self.stats_text.delete(1.0, tk.END)
+        self.stats_text.insert(tk.END, stats_text)
+        self.stats_text.config(state=tk.DISABLED)
+
     def _update_conversation_list(self):
-        """更新对话列表"""
+        """更新对话列表（支持分页）"""
         # 临时解绑选择事件，避免清空列表时触发
         self.conversation_tree.unbind('<<TreeviewSelect>>')
 
@@ -1096,14 +1213,27 @@ class ClaudeHistoryGUI:
         for item in self.conversation_tree.get_children():
             self.conversation_tree.delete(item)
 
-        # 添加对话
-        for conv in self.current_conversations:
+        # 计算分页范围
+        start_idx = (self.current_page - 1) * self.page_size
+        end_idx = start_idx + self.page_size
+
+        # 获取当前页的对话
+        page_conversations = self.filtered_conversations[start_idx:end_idx]
+
+        # 添加当前页的对话
+        for conv in page_conversations:
             token_count = conv.get('total_tokens', 0)
             token_str = self.token_calculator.format_tokens(token_count) if token_count > 0 else "未知"
 
+            # 如果是搜索结果，添加匹配数量标识
+            if 'matches' in conv:
+                display_name = f"🔍 {conv['file_name']} ({len(conv['matches'])} 匹配)"
+            else:
+                display_name = conv['file_name']
+
             self.conversation_tree.insert("", tk.END,
                                        values=(
-                                           conv['file_name'],
+                                           display_name,
                                            conv['modified_time'].strftime("%Y-%m-%d %H:%M:%S"),
                                            conv['message_count'],
                                            token_str,
@@ -1112,6 +1242,9 @@ class ClaudeHistoryGUI:
 
         # 重新绑定选择事件
         self.conversation_tree.bind('<<TreeviewSelect>>', self._on_conversation_select)
+
+        # 更新分页信息
+        self._update_pagination_info()
 
     def _sort_conversations(self, column: str):
         """排序对话列表"""
@@ -1136,15 +1269,19 @@ class ClaudeHistoryGUI:
 
             # 根据列名进行排序
             if column == "文件名":
-                self.current_conversations.sort(key=lambda x: x['file_name'].lower(), reverse=self.sort_reverse)
+                self.filtered_conversations.sort(key=lambda x: x['file_name'].lower(), reverse=self.sort_reverse)
             elif column == "修改时间":
-                self.current_conversations.sort(key=lambda x: x['modified_time'], reverse=self.sort_reverse)
+                self.filtered_conversations.sort(key=lambda x: x['modified_time'], reverse=self.sort_reverse)
             elif column == "消息数":
-                self.current_conversations.sort(key=lambda x: x['message_count'], reverse=self.sort_reverse)
+                self.filtered_conversations.sort(key=lambda x: x['message_count'], reverse=self.sort_reverse)
             elif column == "Token":
-                self.current_conversations.sort(key=lambda x: x.get('total_tokens', 0), reverse=self.sort_reverse)
+                self.filtered_conversations.sort(key=lambda x: x.get('total_tokens', 0), reverse=self.sort_reverse)
             elif column == "大小":
-                self.current_conversations.sort(key=lambda x: x['file_size'], reverse=self.sort_reverse)
+                self.filtered_conversations.sort(key=lambda x: x['file_size'], reverse=self.sort_reverse)
+
+            # 重置到第一页
+            self.current_page = 1
+            self._update_pagination()
 
             # 保存当前选中的对话（如果有）
             selected_items = self.conversation_tree.selection()
@@ -1272,48 +1409,59 @@ class ClaudeHistoryGUI:
             messagebox.showwarning("警告", "请先选择项目")
             return
 
+        # 显示搜索进度条
+        self._show_progress(f"正在搜索 '{keyword}'...")
         self.status_bar.config(text="正在搜索...")
-        self.root.update()
 
         # 在后台线程中搜索
         threading.Thread(target=self._search_conversations_thread, args=(keyword,), daemon=True).start()
 
     def _search_conversations_thread(self, keyword: str):
-        """后台线程搜索对话（优化版）"""
+        """后台线程搜索对话（优化版，带进度条）"""
         try:
             # 检查搜索缓存
+            self.root.after(0, lambda: self._update_progress(20, "检查搜索缓存..."))
             cache_key = f"{self.current_project}:{keyword}"
             if cache_key in self._search_cache:
                 cached_results = self._search_cache[cache_key]
+                self.root.after(0, lambda: self._update_progress(100, f"从缓存加载结果"))
                 self.root.after(0, lambda: self._show_search_results(cached_results, keyword))
+                self.root.after(0, lambda: self._hide_progress())
                 self.root.after(0, lambda: self.status_bar.config(text=f"搜索 '{keyword}' 找到 {len(cached_results)} 个对话 (缓存)"))
                 return
 
             # 编译正则表达式
+            self.root.after(0, lambda: self._update_progress(30, "编译搜索模式..."))
             start_time = time.time()
             pattern = re.compile(keyword, re.IGNORECASE)
 
             # 使用线程池并发搜索
+            self.root.after(0, lambda: self._update_progress(50, f"搜索 {len(self.current_conversations)} 个对话..."))
             if len(self.current_conversations) > 5:
                 results = self._search_conversations_parallel(pattern)
             else:
                 results = self._search_conversations_sequential(pattern)
 
             # 缓存搜索结果
+            self.root.after(0, lambda: self._update_progress(80, "缓存搜索结果..."))
             self._cache_search_results(cache_key, results)
 
             search_time = time.time() - start_time
 
             # 更新UI
+            self.root.after(0, lambda: self._update_progress(95, "更新显示结果..."))
             self.root.after(0, lambda: self._show_search_results(results, keyword))
+            self.root.after(0, lambda: self._hide_progress())
             self.root.after(0, lambda: self.status_bar.config(
                 text=f"搜索 '{keyword}' 找到 {len(results)} 个对话 (耗时: {search_time:.2f}s)"
             ))
 
         except re.error as e:
+            self.root.after(0, lambda: self._hide_progress())
             self.root.after(0, lambda: messagebox.showerror("错误", f"搜索表达式无效: {e}"))
             self.root.after(0, lambda: self.status_bar.config(text="搜索失败"))
         except Exception as e:
+            self.root.after(0, lambda: self._hide_progress())
             self.root.after(0, lambda: messagebox.showerror("错误", f"搜索失败: {e}"))
             self.root.after(0, lambda: self.status_bar.config(text="搜索失败"))
 
@@ -1444,33 +1592,19 @@ class ClaudeHistoryGUI:
             return ''
 
     def _show_search_results(self, results: List[Dict], keyword: str):
-        """显示搜索结果"""
-        # 临时解绑选择事件，避免清空列表时触发
-        self.conversation_tree.unbind('<<TreeviewSelect>>')
+        """显示搜索结果（支持分页）"""
+        # 设置筛选列表为搜索结果
+        self.filtered_conversations = results
 
-        # 清空列表
-        for item in self.conversation_tree.get_children():
-            self.conversation_tree.delete(item)
+        # 重置到第一页
+        self.current_page = 1
+        self._update_pagination()
 
-        # 添加搜索结果
-        for result in results:
-            # 在文件名中添加匹配数量标识
-            display_name = f"🔍 {result['file_name']} ({len(result['matches'])} 匹配)"
+        # 更新对话列表显示
+        self._update_conversation_list()
 
-            token_count = result.get('total_tokens', 0)
-            token_str = self.token_calculator.format_tokens(token_count) if token_count > 0 else "未知"
-
-            self.conversation_tree.insert("", tk.END,
-                                       values=(
-                                           display_name,
-                                           result['modified_time'].strftime("%Y-%m-%d %H:%M:%S"),
-                                           result['message_count'],
-                                           token_str,
-                                           self._format_file_size(result['file_size'])
-                                       ))
-
-        # 重新绑定选择事件
-        self.conversation_tree.bind('<<TreeviewSelect>>', self._on_conversation_select)
+        # 更新统计显示
+        self._update_stats_display()
 
         self.status_bar.config(text=f"搜索 '{keyword}' 找到 {len(results)} 个对话")
 
@@ -1478,6 +1612,10 @@ class ClaudeHistoryGUI:
         """清除搜索"""
         self.search_var.set("")
         if self.current_project:
+            # 恢复原始对话列表
+            self.filtered_conversations = self.current_conversations.copy()
+            self.current_page = 1
+            self._update_pagination()
             self._update_conversation_list()
             self.status_bar.config(text=f"项目: {self.current_project} - {len(self.current_conversations)} 个对话")
 
@@ -1611,12 +1749,33 @@ class ClaudeHistoryGUI:
                         self.projects_data[self.current_project].pop(i)
                         break
 
+            # 从filtered_conversations中移除
+            for i, conv_item in enumerate(self.filtered_conversations[:]):
+                if conv_item['file_path'] == conv['file_path']:
+                    self.filtered_conversations.pop(i)
+                    break
+
+            # 清理相关缓存
+            self._cleanup_deleted_conversation_cache(conv['file_path'])
+
+            # 检查当前页是否还有数据，如果没有则跳转到上一页
+            if self.filtered_conversations and self.current_page > 1:
+                start_idx = (self.current_page - 1) * self.page_size
+                if start_idx >= len(self.filtered_conversations):
+                    self.current_page = max(1, self.current_page - 1)
+
+            # 更新分页状态
+            self._update_pagination()
+
             # 更新UI
             self._update_conversation_list()
             # 清空对话内容显示区域
             self.conversation_info_label.config(text="未选择对话")
             self.message_listbox.delete(0, tk.END)
             self.content_text.delete(1.0, tk.END)
+
+            # 更新统计显示
+            self._update_stats_display()
 
             messagebox.showinfo("成功", f"已删除对话: {conv['file_name']}")
             self.status_bar.config(text=f"已删除对话，剩余 {len(self.current_conversations)} 个")
@@ -1630,6 +1789,50 @@ class ClaudeHistoryGUI:
                 messagebox.showerror("错误", f"删除失败: {e}")
         except Exception as e:
             messagebox.showerror("错误", f"删除失败: {e}")
+
+    def _cleanup_deleted_conversation_cache(self, file_path: str):
+        """清理已删除对话的相关缓存"""
+        try:
+            # 清理文件分析缓存
+            file_path_obj = Path(file_path)
+            cache_keys_to_remove = []
+
+            for cache_key in self._file_analysis_cache:
+                if cache_key.startswith(str(file_path_obj)):
+                    cache_keys_to_remove.append(cache_key)
+
+            for key in cache_keys_to_remove:
+                del self._file_analysis_cache[key]
+
+            # 清理搜索缓存（可能包含该文件的搜索结果）
+            search_cache_keys_to_remove = []
+            for cache_key in self._search_cache:
+                # 检查搜索结果中是否包含已删除的文件
+                cached_results = self._search_cache[cache_key]
+                for result in cached_results:
+                    if result.get('file_path') == file_path:
+                        search_cache_keys_to_remove.append(cache_key)
+                        break
+
+            for key in search_cache_keys_to_remove:
+                del self._search_cache[key]
+
+            # 清理token计算器中的消息缓存
+            if hasattr(self.token_calculator, '_message_token_cache'):
+                token_cache_keys_to_remove = []
+                for cache_key in self.token_calculator._message_token_cache:
+                    # 简单的清理策略：清理所有缓存，因为无法精确对应文件
+                    token_cache_keys_to_remove.append(cache_key)
+
+                # 限制清理数量，避免清理过多
+                if len(token_cache_keys_to_remove) > 100:
+                    token_cache_keys_to_remove = token_cache_keys_to_remove[:100]
+
+                for key in token_cache_keys_to_remove:
+                    del self.token_calculator._message_token_cache[key]
+
+        except Exception as e:
+            print(f"清理缓存时出错: {e}")
 
     def _export_conversation_markdown(self):
         """导出对话为Markdown"""
@@ -1904,40 +2107,253 @@ class ClaudeHistoryGUI:
 
         about_text = f"""Claude Code 历史对话管理器 - GUI版本
 
-版本: 1.2.0 - 性能优化版
+版本: 2.0.0 - UI体验优化版
 作者: Claude
 
 功能特性:
 • 浏览和管理Claude Code历史对话
 • 查看完整对话内容
-• 搜索对话内容（并发搜索 + 缓存）
+• 智能搜索对话内容（并发搜索 + 缓存 + 相关性排序）
+• 分页浏览支持大量对话（20/50/100/200条/页）
 • 导出对话为Markdown/JSON格式
 • 安全删除对话
 • 备份所有对话
 • Token计算和成本估算
-• 性能优化（并发处理 + 缓存机制）
+• 实时统计显示面板
+• 丰富的键盘快捷键支持
+
+UI优化特性:
+• 分页浏览 - 高效处理大量对话
+• 实时统计 - 项目数据实时显示
+• 进度指示器 - 异步操作进度反馈
+• 键盘导航 - 完整的快捷键支持
+• 焦点管理 - 智能焦点切换
+• 响应式界面 - 优化用户体验
+
+键盘快捷键:
+• Ctrl+F - 搜索 | F5 - 刷新 | Ctrl+R - 删除对话
+• Ctrl+E - 导出 | Esc - 清除搜索
+• 方向键 - 导航对话 | PageUp/Down - 分页
+• Home/End - 首页/末页 | Tab - 切换面板焦点
 
 性能统计:
 • Token缓存命中率: {token_hit_rate:.1f}% ({token_hits}/{token_total})
 • 搜索缓存大小: {search_cache_size} 项
 • 文件分析缓存: {file_cache_size} 项
 • 计算器模式: {'精确模式' if self.token_calculator.precise_mode else '估算模式'}
+• 分页大小: {self.page_size} 条/页
 
 技术栈:
 • Python + tkinter
 • concurrent.futures 并发处理
 • LRU缓存优化
 • 跨平台支持
-
-性能优化特性:
-• 多线程并发扫描
-• 智能缓存机制
-• 延迟加载
-• 搜索结果缓存
+• 响应式UI设计
 
 © 2025 All rights reserved."""
 
         messagebox.showinfo("关于", about_text)
+
+    def _update_pagination(self):
+        """更新分页状态"""
+        if not self.filtered_conversations:
+            self.total_pages = 1
+        else:
+            self.total_pages = (len(self.filtered_conversations) + self.page_size - 1) // self.page_size
+
+        # 确保当前页在有效范围内
+        if self.current_page < 1:
+            self.current_page = 1
+        elif self.current_page > self.total_pages:
+            self.current_page = self.total_pages
+
+    def _update_pagination_info(self):
+        """更新分页信息显示"""
+        if self.total_pages <= 1:
+            page_text = f"共 {len(self.filtered_conversations)} 个对话"
+        else:
+            start_idx = (self.current_page - 1) * self.page_size + 1
+            end_idx = min(self.current_page * self.page_size, len(self.filtered_conversations))
+            page_text = f"第 {self.current_page} 页，共 {self.total_pages} 页 | 显示 {start_idx}-{end_idx} 项，共 {len(self.filtered_conversations)} 项"
+
+        self.page_info_label.config(text=page_text)
+
+        # 更新按钮状态
+        self.first_page_btn.config(state=tk.NORMAL if self.current_page > 1 else tk.DISABLED)
+        self.prev_page_btn.config(state=tk.NORMAL if self.current_page > 1 else tk.DISABLED)
+        self.next_page_btn.config(state=tk.NORMAL if self.current_page < self.total_pages else tk.DISABLED)
+        self.last_page_btn.config(state=tk.NORMAL if self.current_page < self.total_pages else tk.DISABLED)
+
+        # 更新页码输入框
+        self.page_var.set(str(self.current_page))
+
+    def _go_to_first_page(self):
+        """跳转到第一页"""
+        if self.current_page != 1:
+            self.current_page = 1
+            self._update_conversation_list()
+
+    def _go_to_prev_page(self):
+        """跳转到上一页"""
+        if self.current_page > 1:
+            self.current_page -= 1
+            self._update_conversation_list()
+
+    def _go_to_next_page(self):
+        """跳转到下一页"""
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            self._update_conversation_list()
+
+    def _go_to_last_page(self):
+        """跳转到最后一页"""
+        if self.current_page != self.total_pages:
+            self.current_page = self.total_pages
+            self._update_conversation_list()
+
+    def _jump_to_page(self, event=None):
+        """跳转到指定页"""
+        try:
+            page_num = int(self.page_var.get())
+            if 1 <= page_num <= self.total_pages:
+                if self.current_page != page_num:
+                    self.current_page = page_num
+                    self._update_conversation_list()
+            else:
+                # 恢复当前页码
+                self.page_var.set(str(self.current_page))
+                messagebox.showwarning("警告", f"页码必须在 1-{self.total_pages} 之间")
+        except ValueError:
+            # 恢复当前页码
+            self.page_var.set(str(self.current_page))
+            messagebox.showwarning("警告", "请输入有效的页码")
+
+    def _on_page_size_change(self, event=None):
+        """页码大小改变事件"""
+        try:
+            new_page_size = int(self.page_size_var.get())
+            if self.page_size != new_page_size:
+                self.page_size = new_page_size
+                self.current_page = 1  # 重置到第一页
+                self._update_pagination()
+                self._update_conversation_list()
+        except ValueError:
+            # 恢复原始页码大小
+            self.page_size_var.set(str(self.page_size))
+
+    def _show_progress(self, message: str = "正在处理..."):
+        """显示进度条"""
+        self.progress_label.config(text=message)
+        self.progress_bar.pack(side=tk.LEFT, padx=(0, 10))
+        self.progress_label.pack(side=tk.LEFT)
+        self.progress_var.set(0)
+        self.root.update()
+
+    def _update_progress(self, value: float, message: str = None):
+        """更新进度条"""
+        self.progress_var.set(value)
+        if message:
+            self.progress_label.config(text=message)
+        self.root.update()
+
+    def _hide_progress(self):
+        """隐藏进度条"""
+        self.progress_bar.pack_forget()
+        self.progress_label.pack_forget()
+        self.progress_var.set(0)
+        self.root.update()
+
+    def _setup_keyboard_shortcuts(self):
+        """设置键盘快捷键"""
+        # Ctrl+F - 搜索
+        self.root.bind('<Control-f>', lambda e: self._focus_search())
+        self.root.bind('<Control-F>', lambda e: self._focus_search())
+
+        # F5 - 刷新
+        self.root.bind('<F5>', lambda e: self._load_projects())
+
+        # Ctrl+R - 删除对话
+        self.root.bind('<Control-r>', lambda e: self._delete_conversation())
+        self.root.bind('<Control-R>', lambda e: self._delete_conversation())
+
+        # Ctrl+E - 导出当前对话
+        self.root.bind('<Control-e>', lambda e: self._export_current_markdown())
+        self.root.bind('<Control-E>', lambda e: self._export_current_markdown())
+
+        # Escape - 清除搜索
+        self.root.bind('<Escape>', lambda e: self._clear_search())
+
+        # 方向键 - 导航对话列表
+        self.root.bind('<Up>', lambda e: self._navigate_conversation_list(-1))
+        self.root.bind('<Down>', lambda e: self._navigate_conversation_list(1))
+
+        # PageUp/PageDown - 分页导航
+        self.root.bind('<Prior>', lambda e: self._go_to_prev_page())  # PageUp
+        self.root.bind('<Next>', lambda e: self._go_to_next_page())   # PageDown
+
+        # Home/End - 首页/末页
+        self.root.bind('<Home>', lambda e: self._go_to_first_page())
+        self.root.bind('<End>', lambda e: self._go_to_last_page())
+
+        # Enter - 查看选中的对话
+        self.root.bind('<Return>', lambda e: self._view_conversation())
+
+        # Tab - 在面板间切换焦点
+        self.root.bind('<Control-Tab>', lambda e: self._switch_panel_focus())
+        self.root.bind('<Control-Shift-Tab>', lambda e: self._switch_panel_focus(reverse=True))
+
+        # Ctrl+1/2/3 - 直接切换到项目/搜索/对话列表
+        self.root.bind('<Control-1>', lambda e: self._focus_project_combo())
+        self.root.bind('<Control-2>', lambda e: self._focus_search())
+        self.root.bind('<Control-3>', lambda e: self._focus_conversation_list())
+
+    def _focus_search(self):
+        """聚焦到搜索框"""
+        self.search_entry.focus_set()
+        self.search_entry.select_range(0, tk.END)
+
+    def _focus_project_combo(self):
+        """聚焦到项目选择框"""
+        self.project_combo.focus_set()
+        self.project_combo.open_dropdown()
+
+    def _focus_conversation_list(self):
+        """聚焦到对话列表"""
+        self.conversation_tree.focus_set()
+        if self.conversation_tree.get_children():
+            self.conversation_tree.selection_set(self.conversation_tree.get_children()[0])
+
+    def _navigate_conversation_list(self, direction: int):
+        """在对话列表中导航"""
+        items = self.conversation_tree.get_children()
+        if not items:
+            return
+
+        selected = self.conversation_tree.selection()
+        if selected:
+            current_index = items.index(selected[0])
+        else:
+            current_index = -1
+
+        new_index = current_index + direction
+        if 0 <= new_index < len(items):
+            self.conversation_tree.selection_set(items[new_index])
+            self.conversation_tree.see(items[new_index])
+            self._view_conversation(show_warning=False)
+
+    def _switch_panel_focus(self, reverse: bool = False):
+        """在面板间切换焦点"""
+        widgets = [self.project_combo, self.search_entry, self.conversation_tree,
+                  self.message_listbox, self.content_text]
+
+        current_focus = self.root.focus_get()
+        if current_focus in widgets:
+            current_index = widgets.index(current_focus)
+            if reverse:
+                new_index = (current_index - 1) % len(widgets)
+            else:
+                new_index = (current_index + 1) % len(widgets)
+            widgets[new_index].focus_set()
 
     def cleanup(self):
         """清理资源，防止内存泄漏"""
