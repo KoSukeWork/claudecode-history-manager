@@ -15,6 +15,241 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import threading
+import concurrent.futures
+from functools import lru_cache
+import time
+
+
+class TokenCalculator:
+    """Token计算器 - 支持精确计算和智能估算"""
+
+    def __init__(self):
+        self.encoder = None
+        self.precise_mode = False
+        self._init_encoder()
+
+        # 缓存统计
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    @lru_cache(maxsize=1024)
+    def count_tokens_cached(self, text: str) -> int:
+        """带缓存的token计算"""
+        return self.count_tokens(text)
+
+    def _init_encoder(self):
+        """初始化token编码器"""
+        try:
+            import tiktoken
+            self.encoder = tiktoken.get_encoding("o200k_base")  # Claude使用的编码器
+            self.precise_mode = True
+            print("✅ 已加载tiktoken，使用精确token计算模式")
+        except ImportError:
+            self.encoder = None
+            self.precise_mode = False
+            print("⚠️  未安装tiktoken，使用智能估算模式")
+        except Exception as e:
+            self.encoder = None
+            self.precise_mode = False
+            print(f"⚠️  tiktoken初始化失败: {e}，使用智能估算模式")
+
+    def count_tokens(self, text: str) -> int:
+        """计算文本的token数量"""
+        if not text or not text.strip():
+            return 0
+
+        text = text.strip()
+
+        # 精确模式
+        if self.precise_mode and self.encoder:
+            try:
+                return len(self.encoder.encode(text))
+            except Exception as e:
+                print(f"Token计算错误，切换到估算模式: {e}")
+                return self._estimate_tokens(text)
+
+        # 估算模式
+        return self._estimate_tokens(text)
+
+    def _estimate_tokens(self, text: str) -> int:
+        """智能token估算算法"""
+        if not text:
+            return 0
+
+        # 中文字符统计
+        chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+
+        # 英文字符统计
+        english_chars = len(re.findall(r"[a-zA-Z]", text))
+
+        # 数字统计
+        digit_chars = len(re.findall(r"[0-9]", text))
+
+        # 标点符号和空格
+        space_chars = len(re.findall(r"\s", text))
+        punct_chars = len(re.findall(r"[^\w\s\u4e00-\u9fff]", text))
+
+        # Token估算规则（基于Claude的tokenization特点）
+        # 中文字符：通常1-2个字符=1token
+        chinese_tokens = chinese_chars * 1.8
+
+        # 英文单词：平均4个字符=1token
+        english_tokens = english_chars / 4.0
+
+        # 数字：通常1-3个数字=1token
+        digit_tokens = digit_chars / 2.0
+
+        # 空格和标点：通常多个=1token
+        other_tokens = (space_chars + punct_chars) / 5.0
+
+        total_tokens = chinese_tokens + english_tokens + digit_tokens + other_tokens
+
+        return max(1, int(total_tokens))
+
+    def count_message_tokens(self, message_data: Dict) -> int:
+        """计算单个消息的token数量（带缓存）"""
+        # 为消息创建缓存键（基于消息内容的hash）
+        cache_key = self._create_message_cache_key(message_data)
+
+        if hasattr(self, '_message_token_cache'):
+            if cache_key in self._message_token_cache:
+                self.cache_hits += 1
+                return self._message_token_cache[cache_key]
+        else:
+            self._message_token_cache = {}
+
+        self.cache_misses += 1
+        total_tokens = self._calculate_message_tokens(message_data)
+
+        # 缓存结果
+        self._message_token_cache[cache_key] = total_tokens
+
+        # 限制缓存大小
+        if len(self._message_token_cache) > 500:
+            # 删除一些旧缓存
+            keys_to_remove = list(self._message_token_cache.keys())[:100]
+            for key in keys_to_remove:
+                del self._message_token_cache[key]
+
+        return total_tokens
+
+    def _create_message_cache_key(self, message_data: Dict) -> str:
+        """为消息创建缓存键"""
+        try:
+            # 创建基于内容的hash
+            import hashlib
+            content_str = json.dumps(message_data, sort_keys=True, ensure_ascii=False)
+            return hashlib.md5(content_str.encode('utf-8')).hexdigest()[:16]
+        except:
+            # 如果序列化失败，使用类型和时间戳作为键
+            msg_type = message_data.get('type', 'unknown')
+            timestamp = message_data.get('timestamp', '')
+            return f"{msg_type}_{timestamp}"
+
+    def _calculate_message_tokens(self, message_data: Dict) -> int:
+        """实际计算消息token数量"""
+        total_tokens = 0
+
+        msg_type = message_data.get('type', '')
+
+        if msg_type == 'summary':
+            # 摘要消息
+            summary = message_data.get('summary', '')
+            total_tokens += self.count_tokens_cached(summary)
+
+        elif msg_type in ['user', 'assistant']:
+            # 用户和助手消息
+            message = message_data.get('message', {})
+            content = message.get('content', '')
+
+            if isinstance(content, str):
+                total_tokens += self.count_tokens_cached(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if item.get('type') == 'text':
+                        total_tokens += self.count_tokens_cached(item.get('text', ''))
+                    elif item.get('type') == 'image':
+                        # 图片消息通常有固定的token开销
+                        total_tokens += 85  # Claude的图片token估算值
+
+        # 消息结构开销（JSON结构、时间戳等）
+        total_tokens += 10  # 基础结构开销
+
+        return total_tokens
+
+    def analyze_conversation_tokens(self, conversation_data: List[Dict]) -> Dict:
+        """分析整个对话的token使用情况"""
+        if not conversation_data:
+            return {
+                'total_tokens': 0,
+                'user_tokens': 0,
+                'assistant_tokens': 0,
+                'summary_tokens': 0,
+                'message_count': 0,
+                'avg_tokens_per_message': 0
+            }
+
+        total_tokens = 0
+        user_tokens = 0
+        assistant_tokens = 0
+        summary_tokens = 0
+        message_count = 0
+
+        for line_num, data in conversation_data:
+            msg_type = data.get('type', '')
+            msg_tokens = self.count_message_tokens(data)
+
+            total_tokens += msg_tokens
+            message_count += 1
+
+            if msg_type == 'user':
+                user_tokens += msg_tokens
+            elif msg_type == 'assistant':
+                assistant_tokens += msg_tokens
+            elif msg_type == 'summary':
+                summary_tokens += msg_tokens
+
+        avg_tokens = total_tokens / message_count if message_count > 0 else 0
+
+        return {
+            'total_tokens': total_tokens,
+            'user_tokens': user_tokens,
+            'assistant_tokens': assistant_tokens,
+            'summary_tokens': summary_tokens,
+            'message_count': message_count,
+            'avg_tokens_per_message': round(avg_tokens, 1)
+        }
+
+    def format_tokens(self, token_count: int) -> str:
+        """格式化token数量显示"""
+        if token_count < 1000:
+            return f"{token_count:,}"
+        elif token_count < 1000000:
+            return f"{token_count/1000:.1f}K"
+        else:
+            return f"{token_count/1000000:.1f}M"
+
+    def get_token_cost_estimate(self, token_count: int, model: str = "claude-3-5-sonnet") -> Dict:
+        """估算token成本（基于Claude定价）"""
+        # 定价数据（每1M tokens的美元价格）
+        pricing = {
+            "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
+            "claude-3-5-haiku": {"input": 0.25, "output": 1.25},
+            "claude-3-opus": {"input": 15.0, "output": 75.0},
+        }
+
+        if model not in pricing:
+            model = "claude-3-5-sonnet"
+
+        input_cost = (token_count / 1000000) * pricing[model]["input"]
+        output_cost = (token_count / 1000000) * pricing[model]["output"]
+
+        return {
+            "model": model,
+            "input_cost": round(input_cost, 4),
+            "output_cost": round(output_cost, 4),
+            "total_cost": round(input_cost + output_cost, 4)
+        }
 
 
 class ConversationViewer:
@@ -26,10 +261,28 @@ class ConversationViewer:
         self.current_conversation_info = None
 
     def show_conversation(self, file_path: str, conversation_info: Dict):
-        """显示对话内容到主界面"""
+        """显示对话内容到主界面（延迟加载）"""
         self.current_conversation_info = conversation_info
         self.current_data = []
 
+        # 先显示加载状态
+        self.parent.conversation_info_label.config(
+            text=f"{conversation_info['file_name']} (正在加载...)"
+        )
+        self.parent.message_listbox.delete(0, tk.END)
+        self.parent.message_listbox.insert(tk.END, "🔄 正在加载对话内容...")
+        self.parent.content_text.delete(1.0, tk.END)
+        self.parent.content_text.insert(tk.END, "正在加载对话内容，请稍候...")
+
+        # 在后台线程中加载对话内容
+        threading.Thread(
+            target=self._load_conversation_content,
+            args=(file_path, conversation_info),
+            daemon=True
+        ).start()
+
+    def _load_conversation_content(self, file_path: str, conversation_info: Dict):
+        """后台加载对话内容"""
         try:
             # 检查文件是否存在
             if not os.path.exists(file_path):
@@ -40,13 +293,29 @@ class ConversationViewer:
             if file_size == 0:
                 raise ValueError(f"对话文件为空: {file_path}")
 
+            # 延迟加载：先读取前几条消息快速显示
+            quick_data = []
+            full_data = []
+
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f, 1):
                     if not line.strip():
                         continue
+
                     try:
                         data = json.loads(line)
-                        self.current_data.append((line_num, data))
+
+                        # 添加到完整数据
+                        full_data.append((line_num, data))
+
+                        # 前10条消息用于快速显示
+                        if len(quick_data) < 10:
+                            quick_data.append((line_num, data))
+
+                        # 每20条消息更新一次UI（对于大文件）
+                        elif len(full_data) % 20 == 0:
+                            self.parent.root.after(0, lambda d=full_data.copy(): self._update_loading_progress(d))
+
                     except json.JSONDecodeError as e:
                         print(f"警告: 跳过无效的JSON行 {line_num}: {e}")
                         continue
@@ -54,21 +323,36 @@ class ConversationViewer:
                         print(f"警告: 处理行 {line_num} 时出错: {e}")
                         continue
 
-            # 更新父界面的对话内容区域
-            self.parent.update_conversation_content(conversation_info, self.current_data)
+            # 设置完整数据
+            self.current_data = full_data
+
+            # 更新UI
+            self.parent.root.after(0, lambda: self._finish_loading(conversation_info, full_data))
 
         except FileNotFoundError as e:
-            messagebox.showerror("错误", f"文件不存在: {e}")
+            self.parent.root.after(0, lambda: messagebox.showerror("错误", f"文件不存在: {e}"))
         except PermissionError as e:
-            messagebox.showerror("错误", f"没有文件读取权限: {e}")
+            self.parent.root.after(0, lambda: messagebox.showerror("错误", f"没有文件读取权限: {e}"))
         except UnicodeDecodeError as e:
-            messagebox.showerror("错误", f"文件编码错误: {e}")
+            self.parent.root.after(0, lambda: messagebox.showerror("错误", f"文件编码错误: {e}"))
         except ValueError as e:
-            messagebox.showerror("错误", f"文件格式错误: {e}")
+            self.parent.root.after(0, lambda: messagebox.showerror("错误", f"文件格式错误: {e}"))
         except Exception as e:
-            messagebox.showerror("错误", f"读取对话文件失败: {e}")
+            self.parent.root.after(0, lambda: messagebox.showerror("错误", f"读取对话文件失败: {e}"))
             # 记录详细错误用于调试
             print(f"读取对话文件时发生未知错误: {e}", file=sys.stderr)
+
+    def _update_loading_progress(self, current_data):
+        """更新加载进度"""
+        count = len(current_data)
+        self.parent.conversation_info_label.config(
+            text=f"{self.current_conversation_info['file_name']} (已加载 {count} 条消息...)"
+        )
+
+    def _finish_loading(self, conversation_info: Dict, full_data: List[Tuple]):
+        """完成加载并更新UI"""
+        # 更新父界面的对话内容区域
+        self.parent.update_conversation_content(conversation_info, full_data)
 
     def populate_message_list(self, message_listbox):
         """填充消息列表到主界面"""
@@ -195,9 +479,32 @@ class ConversationViewer:
             return
 
         try:
+            # 计算token统计
+            token_analysis = self.parent.token_calculator.analyze_conversation_tokens(self.current_data)
+            cost_estimate = self.parent.token_calculator.get_token_cost_estimate(token_analysis['total_tokens'])
+
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write("# 对话导出\n\n")
 
+                # 写入token统计信息
+                f.write("## 📊 Token统计报告\n\n")
+                f.write(f"- **总Token数**: {self.parent.token_calculator.format_tokens(token_analysis['total_tokens'])}\n")
+                f.write(f"- **用户Token**: {self.parent.token_calculator.format_tokens(token_analysis['user_tokens'])}\n")
+                f.write(f"- **助手Token**: {self.parent.token_calculator.format_tokens(token_analysis['assistant_tokens'])}\n")
+                f.write(f"- **摘要Token**: {self.parent.token_calculator.format_tokens(token_analysis['summary_tokens'])}\n")
+                f.write(f"- **消息数量**: {token_analysis['message_count']}\n")
+                f.write(f"- **平均Token/消息**: {token_analysis['avg_tokens_per_message']}\n\n")
+
+                f.write("### 💰 成本估算\n\n")
+                f.write(f"- **模型**: {cost_estimate['model']}\n")
+                f.write(f"- **输入成本**: ${cost_estimate['input_cost']:.4f}\n")
+                f.write(f"- **输出成本**: ${cost_estimate['output_cost']:.4f}\n")
+                f.write(f"- **总成本**: ${cost_estimate['total_cost']:.4f}\n\n")
+
+                f.write("---\n\n")
+
+                # 写入对话内容
+                message_num = 1
                 for line_num, data in self.current_data:
                     msg_type = data.get('type', 'unknown')
                     timestamp = data.get('timestamp', '')
@@ -211,14 +518,19 @@ class ConversationViewer:
                     else:
                         time_str = ""
 
+                    # 计算当前消息的token数
+                    msg_tokens = self.parent.token_calculator.count_message_tokens(data)
+
                     if msg_type == 'user':
-                        f.write(f"## 👤 用户{time_str}\n\n")
+                        f.write(f"## 👤 用户 {message_num}{time_str} ({self.parent.token_calculator.format_tokens(msg_tokens)} tokens)\n\n")
+                        message_num += 1
                     elif msg_type == 'assistant':
-                        f.write(f"## 🤖 助手{time_str}\n\n")
+                        f.write(f"## 🤖 助手 {message_num}{time_str} ({self.parent.token_calculator.format_tokens(msg_tokens)} tokens)\n\n")
+                        message_num += 1
                     elif msg_type == 'summary':
-                        f.write(f"## 📝 摘要{time_str}\n\n")
+                        f.write(f"## 📝 摘要{time_str} ({self.parent.token_calculator.format_tokens(msg_tokens)} tokens)\n\n")
                     else:
-                        f.write(f"## 📄 {msg_type}{time_str}\n\n")
+                        f.write(f"## 📄 {msg_type}{time_str} ({self.parent.token_calculator.format_tokens(msg_tokens)} tokens)\n\n")
 
                     # 写入内容
                     if msg_type == 'summary':
@@ -255,7 +567,29 @@ class ConversationViewer:
             return
 
         try:
-            export_data = [data for line_num, data in self.current_data]
+            # 计算token统计
+            token_analysis = self.parent.token_calculator.analyze_conversation_tokens(self.current_data)
+            cost_estimate = self.parent.token_calculator.get_token_cost_estimate(token_analysis['total_tokens'])
+
+            # 准备导出数据
+            export_data = {
+                "metadata": {
+                    "file_name": self.current_conversation_info['file_name'],
+                    "export_time": datetime.now().isoformat(),
+                    "total_messages": len(self.current_data),
+                    "token_analysis": token_analysis,
+                    "cost_estimate": cost_estimate,
+                    "calculator_mode": "精确模式" if self.parent.token_calculator.precise_mode else "估算模式"
+                },
+                "messages": []
+            }
+
+            # 为每个消息添加token信息
+            for line_num, data in self.current_data:
+                msg_data = data.copy()
+                msg_data["line_number"] = line_num
+                msg_data["token_count"] = self.parent.token_calculator.count_message_tokens(data)
+                export_data["messages"].append(msg_data)
 
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(export_data, f, ensure_ascii=False, indent=2)
@@ -294,6 +628,18 @@ class ClaudeHistoryGUI:
         self.sort_reverse = False  # False: 升序, True: 降序
         self._sorting_in_progress = False  # 防止重复触发排序
         self._sort_block_timer = None  # 排序阻塞定时器
+
+        # 创建Token计算器
+        self.token_calculator = TokenCalculator()
+
+        # 搜索缓存和索引
+        self._search_cache = {}
+        self._search_index = {}  # 简单的搜索索引
+        self._search_cache_max_size = 50
+
+        # 文件分析缓存
+        self._file_analysis_cache = {}
+        self._file_cache_max_size = 100
 
         # 创建组件
         self.conversation_viewer = ConversationViewer(self)
@@ -372,7 +718,7 @@ class ClaudeHistoryGUI:
         tree_scrollbar = ttk.Scrollbar(tree_frame)
         tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        columns = ("文件名", "修改时间", "消息数", "大小")
+        columns = ("文件名", "修改时间", "消息数", "Token", "大小")
         self.conversation_tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                                            yscrollcommand=tree_scrollbar.set)
         self.conversation_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -382,13 +728,15 @@ class ClaudeHistoryGUI:
         self.conversation_tree.heading("文件名", text="文件名", command=lambda: self._sort_conversations("文件名"))
         self.conversation_tree.heading("修改时间", text="修改时间", command=lambda: self._sort_conversations("修改时间"))
         self.conversation_tree.heading("消息数", text="消息数", command=lambda: self._sort_conversations("消息数"))
+        self.conversation_tree.heading("Token", text="Token", command=lambda: self._sort_conversations("Token"))
         self.conversation_tree.heading("大小", text="大小", command=lambda: self._sort_conversations("大小"))
 
         # 设置列宽
-        self.conversation_tree.column("文件名", width=250)
-        self.conversation_tree.column("修改时间", width=150)
-        self.conversation_tree.column("消息数", width=80)
-        self.conversation_tree.column("大小", width=80)
+        self.conversation_tree.column("文件名", width=220)
+        self.conversation_tree.column("修改时间", width=140)
+        self.conversation_tree.column("消息数", width=70)
+        self.conversation_tree.column("Token", width=80)
+        self.conversation_tree.column("大小", width=70)
 
         # 绑定选择事件 - 点击即刷新
         self.conversation_tree.bind('<<TreeviewSelect>>', self._on_conversation_select)
@@ -483,32 +831,116 @@ class ClaudeHistoryGUI:
     def _load_projects_thread(self):
         """后台线程加载项目数据"""
         try:
+            start_time = time.time()
             self.projects_data = {}
 
-            for project_dir in self.projects_path.iterdir():
-                if not project_dir.is_dir():
-                    continue
+            # 获取所有项目目录
+            project_dirs = [d for d in self.projects_path.iterdir() if d.is_dir()]
 
-                project_name = project_dir.name
-                conversations = []
+            if not project_dirs:
+                self.root.after(0, lambda: self._update_projects_ui())
+                return
 
-                # 扫描.jsonl文件
-                for jsonl_file in project_dir.glob("*.jsonl"):
-                    conv_info = self._analyze_conversation_file(jsonl_file)
-                    if conv_info:
-                        conversations.append(conv_info)
+            # 使用线程池并发处理项目
+            max_workers = min(4, len(project_dirs))  # 限制最大并发数
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有项目分析任务
+                future_to_project = {
+                    executor.submit(self._analyze_project_concurrent, project_dir): project_dir
+                    for project_dir in project_dirs
+                }
 
-                if conversations:
-                    # 按修改时间排序
-                    conversations.sort(key=lambda x: x['modified_time'], reverse=True)
-                    self.projects_data[project_name] = conversations
+                # 收集结果
+                completed_count = 0
+                for future in concurrent.futures.as_completed(future_to_project):
+                    project_dir = future_to_project[future]
+                    try:
+                        project_name, conversations = future.result()
+                        if conversations:
+                            self.projects_data[project_name] = conversations
+                        completed_count += 1
+
+                        # 更新进度
+                        progress = (completed_count / len(project_dirs)) * 100
+                        self.root.after(0, lambda p=progress: self.status_bar.config(
+                            text=f"正在加载项目... {completed_count}/{len(project_dirs)} ({p:.0f}%)"
+                        ))
+
+                    except Exception as e:
+                        print(f"分析项目 {project_dir.name} 时出错: {e}")
 
             # 更新UI
-            self.root.after(0, self._update_projects_ui)
+            elapsed_time = time.time() - start_time
+            self.root.after(0, lambda: self._update_projects_ui_with_stats(elapsed_time))
 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("错误", f"加载项目失败: {e}"))
             self.root.after(0, lambda: self.status_bar.config(text="加载失败"))
+
+    def _analyze_project_concurrent(self, project_dir: Path) -> Tuple[str, List[Dict]]:
+        """并发分析单个项目"""
+        project_name = project_dir.name
+        conversations = []
+
+        try:
+            # 获取项目中的所有.jsonl文件
+            jsonl_files = list(project_dir.glob("*.jsonl"))
+
+            if not jsonl_files:
+                return project_name, []
+
+            # 使用线程池并发处理对话文件
+            max_file_workers = min(2, len(jsonl_files))  # 每个项目最多2个并发文件处理
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_file_workers) as file_executor:
+                # 提交所有文件分析任务
+                future_to_file = {
+                    file_executor.submit(self._analyze_conversation_file, jsonl_file): jsonl_file
+                    for jsonl_file in jsonl_files
+                }
+
+                # 收集结果
+                for future in concurrent.futures.as_completed(future_to_file):
+                    jsonl_file = future_to_file[future]
+                    try:
+                        conv_info = future.result()
+                        if conv_info:
+                            conversations.append(conv_info)
+                    except Exception as e:
+                        print(f"分析文件 {jsonl_file.name} 时出错: {e}")
+
+            # 按修改时间排序
+            conversations.sort(key=lambda x: x['modified_time'], reverse=True)
+            return project_name, conversations
+
+        except Exception as e:
+            print(f"分析项目 {project_name} 时出错: {e}")
+            return project_name, []
+
+    def _update_projects_ui_with_stats(self, elapsed_time: float):
+        """更新项目UI并显示性能统计"""
+        # 更新项目下拉框
+        project_names = list(self.projects_data.keys())
+        self.project_combo['values'] = project_names
+
+        if project_names:
+            self.project_combo.set(project_names[0])
+            self._on_project_select(None)
+
+        # 计算总对话数和token数
+        total_conversations = sum(len(convs) for convs in self.projects_data.values())
+        total_tokens = sum(
+            sum(conv.get('total_tokens', 0) for conv in convs)
+            for convs in self.projects_data.values()
+        )
+
+        # 显示加载统计
+        status_text = f"已加载 {len(project_names)} 个项目, {total_conversations} 个对话"
+        if total_tokens > 0:
+            token_str = self.token_calculator.format_tokens(total_tokens)
+            status_text += f", {token_str} tokens"
+        status_text += f" (耗时: {elapsed_time:.2f}s)"
+
+        self.status_bar.config(text=status_text)
 
     def _update_projects_ui(self):
         """更新项目UI"""
@@ -523,15 +955,44 @@ class ClaudeHistoryGUI:
         self.status_bar.config(text=f"已加载 {len(project_names)} 个项目")
 
     def _analyze_conversation_file(self, file_path: Path) -> Optional[Dict]:
-        """分析单个对话文件"""
+        """分析单个对话文件（带缓存）"""
         try:
+            # 检查文件修改时间
             stat = file_path.stat()
+            mtime = stat.st_mtime
 
+            # 创建缓存键
+            cache_key = f"{file_path}:{mtime}"
+
+            # 检查缓存
+            if cache_key in self._file_analysis_cache:
+                return self._file_analysis_cache[cache_key]
+
+            # 分析文件
+            result = self._perform_file_analysis(file_path, stat)
+
+            # 缓存结果
+            if result:
+                self._cache_file_analysis(cache_key, result)
+
+            return result
+
+        except Exception as e:
+            print(f"分析文件失败 {file_path}: {e}")
+            return None
+
+    def _perform_file_analysis(self, file_path: Path, stat) -> Optional[Dict]:
+        """实际执行文件分析"""
+        try:
             # 读取文件基本信息
             message_count = 0
             summary = None
             first_user_msg = None
             last_timestamp = None
+
+            # Token计算相关
+            conversation_data = []
+            total_tokens = 0
 
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f, 1):
@@ -540,6 +1001,7 @@ class ClaudeHistoryGUI:
 
                     try:
                         data = json.loads(line)
+                        conversation_data.append((line_num, data))
 
                         # 统计消息数量
                         if data.get('type') in ['user', 'assistant']:
@@ -569,6 +1031,10 @@ class ClaudeHistoryGUI:
                     except json.JSONDecodeError:
                         continue
 
+            # 计算token使用情况
+            token_analysis = self.token_calculator.analyze_conversation_tokens(conversation_data)
+            total_tokens = token_analysis['total_tokens']
+
             return {
                 'file_name': file_path.name,
                 'file_path': str(file_path),
@@ -578,12 +1044,26 @@ class ClaudeHistoryGUI:
                 'message_count': message_count,
                 'summary': summary,
                 'first_user_msg': first_user_msg,
-                'last_timestamp': last_timestamp
+                'last_timestamp': last_timestamp,
+                # 新增token相关字段
+                'total_tokens': total_tokens,
+                'token_analysis': token_analysis
             }
 
         except Exception as e:
             print(f"分析文件失败 {file_path}: {e}")
             return None
+
+    def _cache_file_analysis(self, cache_key: str, result: Dict):
+        """缓存文件分析结果"""
+        # 限制缓存大小
+        if len(self._file_analysis_cache) >= self._file_cache_max_size:
+            # 删除一些旧缓存
+            keys_to_remove = list(self._file_analysis_cache.keys())[:20]
+            for key in keys_to_remove:
+                del self._file_analysis_cache[key]
+
+        self._file_analysis_cache[cache_key] = result
 
     def _on_project_select(self, event):
         """项目选择事件处理"""
@@ -601,7 +1081,11 @@ class ClaudeHistoryGUI:
         # 更新对话列表
         self._update_conversation_list()
 
-        self.status_bar.config(text=f"项目: {project_name} - {len(self.current_conversations)} 个对话")
+        # 计算项目总token数
+        total_tokens = sum(conv.get('total_tokens', 0) for conv in self.current_conversations)
+        total_tokens_str = self.token_calculator.format_tokens(total_tokens)
+
+        self.status_bar.config(text=f"项目: {project_name} - {len(self.current_conversations)} 个对话, 总计 {total_tokens_str} tokens")
 
     def _update_conversation_list(self):
         """更新对话列表"""
@@ -614,11 +1098,15 @@ class ClaudeHistoryGUI:
 
         # 添加对话
         for conv in self.current_conversations:
+            token_count = conv.get('total_tokens', 0)
+            token_str = self.token_calculator.format_tokens(token_count) if token_count > 0 else "未知"
+
             self.conversation_tree.insert("", tk.END,
                                        values=(
                                            conv['file_name'],
                                            conv['modified_time'].strftime("%Y-%m-%d %H:%M:%S"),
                                            conv['message_count'],
+                                           token_str,
                                            self._format_file_size(conv['file_size'])
                                        ))
 
@@ -653,6 +1141,8 @@ class ClaudeHistoryGUI:
                 self.current_conversations.sort(key=lambda x: x['modified_time'], reverse=self.sort_reverse)
             elif column == "消息数":
                 self.current_conversations.sort(key=lambda x: x['message_count'], reverse=self.sort_reverse)
+            elif column == "Token":
+                self.current_conversations.sort(key=lambda x: x.get('total_tokens', 0), reverse=self.sort_reverse)
             elif column == "大小":
                 self.current_conversations.sort(key=lambda x: x['file_size'], reverse=self.sort_reverse)
 
@@ -728,11 +1218,15 @@ class ClaudeHistoryGUI:
 
         # 添加对话
         for conv in self.current_conversations:
+            token_count = conv.get('total_tokens', 0)
+            token_str = self.token_calculator.format_tokens(token_count) if token_count > 0 else "未知"
+
             self.conversation_tree.insert("", tk.END,
                                        values=(
                                            conv['file_name'],
                                            conv['modified_time'].strftime("%Y-%m-%d %H:%M:%S"),
                                            conv['message_count'],
+                                           token_str,
                                            self._format_file_size(conv['file_size'])
                                        ))
 
@@ -785,30 +1279,115 @@ class ClaudeHistoryGUI:
         threading.Thread(target=self._search_conversations_thread, args=(keyword,), daemon=True).start()
 
     def _search_conversations_thread(self, keyword: str):
-        """后台线程搜索对话"""
+        """后台线程搜索对话（优化版）"""
         try:
-            pattern = re.compile(keyword, re.IGNORECASE)
-            results = []
+            # 检查搜索缓存
+            cache_key = f"{self.current_project}:{keyword}"
+            if cache_key in self._search_cache:
+                cached_results = self._search_cache[cache_key]
+                self.root.after(0, lambda: self._show_search_results(cached_results, keyword))
+                self.root.after(0, lambda: self.status_bar.config(text=f"搜索 '{keyword}' 找到 {len(cached_results)} 个对话 (缓存)"))
+                return
 
-            for conv in self.current_conversations:
-                matches = self._search_in_conversation(conv, pattern)
-                if matches:
-                    result = conv.copy()
-                    result['matches'] = matches
-                    results.append(result)
+            # 编译正则表达式
+            start_time = time.time()
+            pattern = re.compile(keyword, re.IGNORECASE)
+
+            # 使用线程池并发搜索
+            if len(self.current_conversations) > 5:
+                results = self._search_conversations_parallel(pattern)
+            else:
+                results = self._search_conversations_sequential(pattern)
+
+            # 缓存搜索结果
+            self._cache_search_results(cache_key, results)
+
+            search_time = time.time() - start_time
 
             # 更新UI
             self.root.after(0, lambda: self._show_search_results(results, keyword))
+            self.root.after(0, lambda: self.status_bar.config(
+                text=f"搜索 '{keyword}' 找到 {len(results)} 个对话 (耗时: {search_time:.2f}s)"
+            ))
 
+        except re.error as e:
+            self.root.after(0, lambda: messagebox.showerror("错误", f"搜索表达式无效: {e}"))
+            self.root.after(0, lambda: self.status_bar.config(text="搜索失败"))
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("错误", f"搜索失败: {e}"))
             self.root.after(0, lambda: self.status_bar.config(text="搜索失败"))
 
+    def _search_conversations_parallel(self, pattern: re.Pattern) -> List[Dict]:
+        """并发搜索对话"""
+        results = []
+        max_workers = min(4, len(self.current_conversations))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交搜索任务
+            future_to_conv = {
+                executor.submit(self._search_in_conversation, conv, pattern): conv
+                for conv in self.current_conversations
+            }
+
+            # 收集结果
+            for future in concurrent.futures.as_completed(future_to_conv):
+                conv = future_to_conv[future]
+                try:
+                    matches = future.result()
+                    if matches:
+                        result = conv.copy()
+                        result['matches'] = matches
+                        results.append(result)
+                except Exception as e:
+                    print(f"搜索对话 {conv['file_name']} 时出错: {e}")
+
+        return results
+
+    def _search_conversations_sequential(self, pattern: re.Pattern) -> List[Dict]:
+        """顺序搜索对话（用于少量对话）"""
+        results = []
+
+        for conv in self.current_conversations:
+            matches = self._search_in_conversation(conv, pattern)
+            if matches:
+                result = conv.copy()
+                result['matches'] = matches
+                results.append(result)
+
+        return results
+
+    def _cache_search_results(self, cache_key: str, results: List[Dict]):
+        """缓存搜索结果"""
+        # 限制缓存大小
+        if len(self._search_cache) >= self._search_cache_max_size:
+            # 删除最旧的缓存项
+            oldest_key = next(iter(self._search_cache))
+            del self._search_cache[oldest_key]
+
+        self._search_cache[cache_key] = results
+
     def _search_in_conversation(self, conv: Dict, pattern: re.Pattern) -> List[Dict]:
-        """在单个对话中搜索"""
+        """在单个对话中搜索（优化版）"""
         matches = []
 
         try:
+            # 先检查预览文本，如果预览文本匹配则直接返回
+            first_user_msg = conv.get('first_user_msg', '')
+            summary = conv.get('summary', '')
+
+            # 快速检查预览和摘要
+            quick_content = f"{first_user_msg} {summary}"
+            if pattern.search(quick_content):
+                # 如果预览匹配，返回一个快速匹配标记
+                return [{
+                    'line_number': 0,
+                    'field_name': 'preview',
+                    'message_type': 'quick_match',
+                    'timestamp': conv.get('last_timestamp'),
+                    'preview': True
+                }]
+
+            # 如果快速匹配失败，进行全文搜索
             with open(conv['file_path'], 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f, 1):
                     if not line.strip():
@@ -817,33 +1396,20 @@ class ClaudeHistoryGUI:
                     try:
                         data = json.loads(line)
 
-                        # 在不同字段中搜索
-                        search_fields = []
+                        # 使用快速内容提取
+                        content_text = self._extract_searchable_text(data)
+                        if content_text and pattern.search(content_text):
+                            matches.append({
+                                'line_number': line_num,
+                                'field_name': 'content',
+                                'message_type': data.get('type'),
+                                'timestamp': data.get('timestamp'),
+                                'preview': False
+                            })
 
-                        if data.get('type') in ['user', 'assistant']:
-                            content = data.get('message', {}).get('content', '')
-                            if isinstance(content, str):
-                                search_fields.append(('message', content))
-                            elif isinstance(content, list):
-                                for item in content:
-                                    if item.get('type') == 'text':
-                                        search_fields.append(('message', item.get('text', '')))
-
-                        # 搜索摘要
-                        if data.get('type') == 'summary':
-                            summary = data.get('summary', '')
-                            search_fields.append(('summary', summary))
-
-                        # 执行搜索
-                        for field_name, field_content in search_fields:
-                            if pattern.search(field_content):
-                                matches.append({
-                                    'line_number': line_num,
-                                    'field_name': field_name,
-                                    'message_type': data.get('type'),
-                                    'timestamp': data.get('timestamp')
-                                })
-                                break  # 每行只记录一次匹配
+                            # 限制匹配数量，避免返回过多结果
+                            if len(matches) >= 10:
+                                break
 
                     except json.JSONDecodeError:
                         continue
@@ -852,6 +1418,30 @@ class ClaudeHistoryGUI:
             print(f"搜索对话失败 {conv['file_path']}: {e}")
 
         return matches
+
+    def _extract_searchable_text(self, data: Dict) -> str:
+        """快速提取可搜索的文本内容"""
+        try:
+            msg_type = data.get('type', '')
+
+            if msg_type == 'summary':
+                return data.get('summary', '')
+
+            elif msg_type in ['user', 'assistant']:
+                content = data.get('message', {}).get('content', '')
+                if isinstance(content, str):
+                    return content
+                elif isinstance(content, list):
+                    # 只提取文本内容，跳过图片和其他类型
+                    text_parts = []
+                    for item in content:
+                        if item.get('type') == 'text':
+                            text_parts.append(item.get('text', ''))
+                    return ' '.join(text_parts)
+
+            return ''
+        except Exception:
+            return ''
 
     def _show_search_results(self, results: List[Dict], keyword: str):
         """显示搜索结果"""
@@ -866,11 +1456,16 @@ class ClaudeHistoryGUI:
         for result in results:
             # 在文件名中添加匹配数量标识
             display_name = f"🔍 {result['file_name']} ({len(result['matches'])} 匹配)"
+
+            token_count = result.get('total_tokens', 0)
+            token_str = self.token_calculator.format_tokens(token_count) if token_count > 0 else "未知"
+
             self.conversation_tree.insert("", tk.END,
                                        values=(
                                            display_name,
                                            result['modified_time'].strftime("%Y-%m-%d %H:%M:%S"),
                                            result['message_count'],
+                                           token_str,
                                            self._format_file_size(result['file_size'])
                                        ))
 
@@ -950,7 +1545,10 @@ class ClaudeHistoryGUI:
         # 更新对话信息标签
         file_name = conversation_info['file_name']
         message_count = len(messages)
-        self.conversation_info_label.config(text=f"{file_name} ({message_count} 条消息)")
+        token_count = conversation_info.get('total_tokens', 0)
+        token_str = self.token_calculator.format_tokens(token_count) if token_count > 0 else "未知"
+
+        self.conversation_info_label.config(text=f"{file_name} ({message_count} 条消息, {token_str} tokens)")
 
         # 填充消息列表
         self.conversation_viewer.populate_message_list(self.message_listbox)
@@ -979,12 +1577,16 @@ class ClaudeHistoryGUI:
             return
 
         # 确认删除
+        token_count = conv.get('total_tokens', 0)
+        token_str = self.token_calculator.format_tokens(token_count) if token_count > 0 else "未知"
+
         result = messagebox.askyesno(
             "确认删除",
             f"确定要删除对话 '{conv['file_name']}' 吗？\n\n"
             f"此操作不可恢复！\n\n"
             f"文件大小: {self._format_file_size(conv['file_size'])}\n"
-            f"消息数量: {conv['message_count']}"
+            f"消息数量: {conv['message_count']}\n"
+            f"Token数量: {token_str}"
         )
 
         if not result:
@@ -1102,12 +1704,14 @@ class ClaudeHistoryGUI:
         file_name = Path(file_path).stem
         messages = []
         summary = ""
+        conversation_data = []
 
-        for line in lines:
+        for line_num, line in enumerate(lines, 1):
             if not line.strip():
                 continue
             try:
                 data = json.loads(line)
+                conversation_data.append((line_num, data))
 
                 if data.get('type') == 'summary':
                     summary = data.get('summary', '').strip('"')
@@ -1129,14 +1733,36 @@ class ClaudeHistoryGUI:
                     messages.append({
                         'type': msg_type,
                         'content': formatted_content,
-                        'timestamp': timestamp
+                        'timestamp': timestamp,
+                        'raw_data': data
                     })
 
             except json.JSONDecodeError:
                 continue
 
+        # 计算token统计
+        token_analysis = self.token_calculator.analyze_conversation_tokens(conversation_data)
+        cost_estimate = self.token_calculator.get_token_cost_estimate(token_analysis['total_tokens'])
+
         # 生成Markdown内容
         markdown_content = f"# {file_name}\n\n"
+
+        # 添加token统计报告
+        markdown_content += "## 📊 Token统计报告\n\n"
+        markdown_content += f"- **总Token数**: {self.token_calculator.format_tokens(token_analysis['total_tokens'])}\n"
+        markdown_content += f"- **用户Token**: {self.token_calculator.format_tokens(token_analysis['user_tokens'])}\n"
+        markdown_content += f"- **助手Token**: {self.token_calculator.format_tokens(token_analysis['assistant_tokens'])}\n"
+        markdown_content += f"- **摘要Token**: {self.token_calculator.format_tokens(token_analysis['summary_tokens'])}\n"
+        markdown_content += f"- **消息数量**: {token_analysis['message_count']}\n"
+        markdown_content += f"- **平均Token/消息**: {token_analysis['avg_tokens_per_message']}\n\n"
+
+        markdown_content += "### 💰 成本估算\n\n"
+        markdown_content += f"- **模型**: {cost_estimate['model']}\n"
+        markdown_content += f"- **输入成本**: ${cost_estimate['input_cost']:.4f}\n"
+        markdown_content += f"- **输出成本**: ${cost_estimate['output_cost']:.4f}\n"
+        markdown_content += f"- **总成本**: ${cost_estimate['total_cost']:.4f}\n\n"
+
+        markdown_content += "---\n\n"
 
         if summary:
             markdown_content += f"## 摘要\n{summary}\n\n"
@@ -1153,7 +1779,10 @@ class ClaudeHistoryGUI:
                 except:
                     pass
 
-            markdown_content += f"### {role_name} {i}{timestamp_str}\n\n"
+            # 计算消息token数
+            msg_tokens = self.token_calculator.count_message_tokens(msg['raw_data'])
+
+            markdown_content += f"### {role_name} {i}{timestamp_str} ({self.token_calculator.format_tokens(msg_tokens)} tokens)\n\n"
             markdown_content += f"{msg['content']}\n\n"
             markdown_content += "---\n\n"
 
@@ -1166,21 +1795,47 @@ class ClaudeHistoryGUI:
         with open(file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        # 读取并过滤数据
+        # 读取并过滤数据，计算token
+        conversation_data = []
         exported_data = []
 
-        for line in lines:
+        for line_num, line in enumerate(lines, 1):
             if not line.strip():
                 continue
             try:
                 data = json.loads(line)
+                conversation_data.append((line_num, data))
                 exported_data.append(data)
             except json.JSONDecodeError:
                 continue
 
+        # 计算token统计
+        token_analysis = self.token_calculator.analyze_conversation_tokens(conversation_data)
+        cost_estimate = self.token_calculator.get_token_cost_estimate(token_analysis['total_tokens'])
+
+        # 构建完整的导出数据
+        complete_export_data = {
+            "metadata": {
+                "file_name": Path(file_path).name,
+                "export_time": datetime.now().isoformat(),
+                "total_messages": len(exported_data),
+                "token_analysis": token_analysis,
+                "cost_estimate": cost_estimate,
+                "calculator_mode": "精确模式" if self.token_calculator.precise_mode else "估算模式"
+            },
+            "messages": []
+        }
+
+        # 为每个消息添加token信息
+        for line_num, data in conversation_data:
+            msg_data = data.copy()
+            msg_data["line_number"] = line_num
+            msg_data["token_count"] = self.token_calculator.count_message_tokens(data)
+            complete_export_data["messages"].append(msg_data)
+
         # 写入JSON文件
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(exported_data, f, ensure_ascii=False, indent=2)
+            json.dump(complete_export_data, f, ensure_ascii=False, indent=2)
 
     def _set_projects_path(self):
         """设置项目路径"""
@@ -1238,23 +1893,47 @@ class ClaudeHistoryGUI:
 
     def _show_about(self):
         """显示关于信息"""
-        about_text = """Claude Code 历史对话管理器 - GUI版本
+        # 获取缓存统计
+        token_cache_stats = getattr(self.token_calculator, 'cache_hits', 0), getattr(self.token_calculator, 'cache_misses', 0)
+        token_hits, token_misses = token_cache_stats
+        token_total = token_hits + token_misses
+        token_hit_rate = (token_hits / token_total * 100) if token_total > 0 else 0
 
-版本: 1.0.0
+        search_cache_size = len(self._search_cache)
+        file_cache_size = len(getattr(self, '_file_analysis_cache', {}))
+
+        about_text = f"""Claude Code 历史对话管理器 - GUI版本
+
+版本: 1.2.0 - 性能优化版
 作者: Claude
 
 功能特性:
 • 浏览和管理Claude Code历史对话
 • 查看完整对话内容
-• 搜索对话内容
+• 搜索对话内容（并发搜索 + 缓存）
 • 导出对话为Markdown/JSON格式
 • 安全删除对话
 • 备份所有对话
+• Token计算和成本估算
+• 性能优化（并发处理 + 缓存机制）
+
+性能统计:
+• Token缓存命中率: {token_hit_rate:.1f}% ({token_hits}/{token_total})
+• 搜索缓存大小: {search_cache_size} 项
+• 文件分析缓存: {file_cache_size} 项
+• 计算器模式: {'精确模式' if self.token_calculator.precise_mode else '估算模式'}
 
 技术栈:
 • Python + tkinter
-• 纯标准库实现
+• concurrent.futures 并发处理
+• LRU缓存优化
 • 跨平台支持
+
+性能优化特性:
+• 多线程并发扫描
+• 智能缓存机制
+• 延迟加载
+• 搜索结果缓存
 
 © 2025 All rights reserved."""
 
