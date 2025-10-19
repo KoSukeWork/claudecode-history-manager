@@ -749,6 +749,14 @@ class ClaudeHistoryGUI:
         self.conversation_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scrollbar.config(command=self.conversation_tree.yview)
 
+        # 直接在Treeview上绑定自定义键盘事件
+        self.conversation_tree.bind('<Up>', self._navigate_conversation_list_up)
+        self.conversation_tree.bind('<Down>', self._navigate_conversation_list_down)
+        self.conversation_tree.bind('<Prior>', lambda e: self._page_navigation_focused(e) if self.root.focus_get() == self.conversation_tree else None)  # PageUp
+        self.conversation_tree.bind('<Next>', lambda e: self._page_navigation_focused(e) if self.root.focus_get() == self.conversation_tree else None)   # PageDown
+        self.conversation_tree.bind('<Home>', lambda e: self._home_end_navigation_focused(e) if self.root.focus_get() == self.conversation_tree else None)
+        self.conversation_tree.bind('<End>', lambda e: self._home_end_navigation_focused(e) if self.root.focus_get() == self.conversation_tree else None)
+
         # 设置列标题并绑定点击排序事件
         self.conversation_tree.heading("文件名", text="文件名", command=lambda: self._sort_conversations("文件名"))
         self.conversation_tree.heading("修改时间", text="修改时间", command=lambda: self._sort_conversations("修改时间"))
@@ -2557,9 +2565,7 @@ UI优化特性:
         # Escape - 清除搜索
         self.root.bind('<Escape>', lambda e: self._clear_search())
 
-        # 方向键 - 导航对话列表（只在对话列表有焦点时生效）
-        self.root.bind('<Up>', self._navigate_conversation_list_up)
-        self.root.bind('<Down>', self._navigate_conversation_list_down)
+        # 注意：方向键导航现在直接绑定在Treeview上，不再需要全局绑定
 
         # PageUp/PageDown - 分页导航（检查焦点）
         self.root.bind('<Prior>', self._page_navigation_focused)  # PageUp
@@ -2651,24 +2657,14 @@ UI优化特性:
             self._view_conversation(show_warning=False)
 
     def _navigate_conversation_list_up(self, event):
-        """在对话列表中向上导航（检查焦点）"""
-        # 检查焦点是否在对话列表上
-        focused_widget = self.root.focus_get()
-        if focused_widget == self.conversation_tree:
-            self._navigate_conversation_list(-1)
-            return "break"  # 阻止事件传播
-        # 如果焦点在其他控件，则不处理方向键，让系统默认行为生效
-        return None
+        """在对话列表中向上导航（直接绑定到Treeview）"""
+        self._navigate_conversation_list(-1)
+        return "break"  # 阻止Treeview的默认行为
 
     def _navigate_conversation_list_down(self, event):
-        """在对话列表中向下导航（检查焦点）"""
-        # 检查焦点是否在对话列表上
-        focused_widget = self.root.focus_get()
-        if focused_widget == self.conversation_tree:
-            self._navigate_conversation_list(1)
-            return "break"  # 阻止事件传播
-        # 如果焦点在其他控件，则不处理方向键，让系统默认行为生效
-        return None
+        """在对话列表中向下导航（直接绑定到Treeview）"""
+        self._navigate_conversation_list(1)
+        return "break"  # 阻止Treeview的默认行为
 
     def _switch_panel_focus(self, reverse: bool = False):
         """在面板间切换焦点"""
