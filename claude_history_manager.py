@@ -2557,20 +2557,20 @@ UI优化特性:
         # Escape - 清除搜索
         self.root.bind('<Escape>', lambda e: self._clear_search())
 
-        # 方向键 - 导航对话列表
-        self.root.bind('<Up>', lambda e: self._navigate_conversation_list(-1))
-        self.root.bind('<Down>', lambda e: self._navigate_conversation_list(1))
+        # 方向键 - 导航对话列表（只在对话列表有焦点时生效）
+        self.root.bind('<Up>', self._navigate_conversation_list_up)
+        self.root.bind('<Down>', self._navigate_conversation_list_down)
 
-        # PageUp/PageDown - 分页导航
-        self.root.bind('<Prior>', lambda e: self._go_to_prev_page())  # PageUp
-        self.root.bind('<Next>', lambda e: self._go_to_next_page())   # PageDown
+        # PageUp/PageDown - 分页导航（检查焦点）
+        self.root.bind('<Prior>', self._page_navigation_focused)  # PageUp
+        self.root.bind('<Next>', self._page_navigation_focused)   # PageDown
 
-        # Home/End - 首页/末页
-        self.root.bind('<Home>', lambda e: self._go_to_first_page())
-        self.root.bind('<End>', lambda e: self._go_to_last_page())
+        # Home/End - 首页/末页（检查焦点）
+        self.root.bind('<Home>', self._home_end_navigation_focused)
+        self.root.bind('<End>', self._home_end_navigation_focused)
 
-        # Enter - 查看选中的对话
-        self.root.bind('<Return>', lambda e: self._view_conversation())
+        # Enter - 查看选中的对话（只在对话列表有焦点时生效）
+        self.root.bind('<Return>', self._view_conversation_focused)
 
         # Tab - 在面板间切换焦点
         self.root.bind('<Control-Tab>', lambda e: self._switch_panel_focus())
@@ -2589,7 +2589,9 @@ UI优化特性:
     def _focus_project_combo(self):
         """聚焦到项目选择框"""
         self.project_combo.focus_set()
-        self.project_combo.open_dropdown()
+        # 通过模拟鼠标点击来打开下拉列表
+        self.project_combo.event_generate('<ButtonPress-1>')
+        self.project_combo.event_generate('<ButtonRelease-1>')
 
     def _focus_conversation_list(self):
         """聚焦到对话列表"""
@@ -2597,8 +2599,41 @@ UI优化特性:
         if self.conversation_tree.get_children():
             self.conversation_tree.selection_set(self.conversation_tree.get_children()[0])
 
+    def _view_conversation_focused(self, event):
+        """查看选中的对话（检查焦点）"""
+        # 检查焦点是否在对话列表上
+        focused_widget = self.root.focus_get()
+        if focused_widget == self.conversation_tree:
+            self._view_conversation(show_warning=False)
+            return "break"  # 阻止事件传播
+        return None
+
+    def _page_navigation_focused(self, event):
+        """分页导航（检查焦点）"""
+        # 检查焦点是否在对话列表或搜索框上
+        focused_widget = self.root.focus_get()
+        if focused_widget in [self.conversation_tree, self.search_entry]:
+            if event.keysym == 'Prior':
+                self._go_to_prev_page()
+            elif event.keysym == 'Next':
+                self._go_to_next_page()
+            return "break"  # 阻止事件传播
+        return None
+
+    def _home_end_navigation_focused(self, event):
+        """首页/末页导航（检查焦点）"""
+        # 检查焦点是否在对话列表或搜索框上
+        focused_widget = self.root.focus_get()
+        if focused_widget in [self.conversation_tree, self.search_entry]:
+            if event.keysym == 'Home':
+                self._go_to_first_page()
+            elif event.keysym == 'End':
+                self._go_to_last_page()
+            return "break"  # 阻止事件传播
+        return None
+
     def _navigate_conversation_list(self, direction: int):
-        """在对话列表中导航"""
+        """在对话列表中导航（内部方法）"""
         items = self.conversation_tree.get_children()
         if not items:
             return
@@ -2615,6 +2650,26 @@ UI优化特性:
             self.conversation_tree.see(items[new_index])
             self._view_conversation(show_warning=False)
 
+    def _navigate_conversation_list_up(self, event):
+        """在对话列表中向上导航（检查焦点）"""
+        # 检查焦点是否在对话列表上
+        focused_widget = self.root.focus_get()
+        if focused_widget == self.conversation_tree:
+            self._navigate_conversation_list(-1)
+            return "break"  # 阻止事件传播
+        # 如果焦点在其他控件，则不处理方向键，让系统默认行为生效
+        return None
+
+    def _navigate_conversation_list_down(self, event):
+        """在对话列表中向下导航（检查焦点）"""
+        # 检查焦点是否在对话列表上
+        focused_widget = self.root.focus_get()
+        if focused_widget == self.conversation_tree:
+            self._navigate_conversation_list(1)
+            return "break"  # 阻止事件传播
+        # 如果焦点在其他控件，则不处理方向键，让系统默认行为生效
+        return None
+
     def _switch_panel_focus(self, reverse: bool = False):
         """在面板间切换焦点"""
         widgets = [self.project_combo, self.search_entry, self.conversation_tree,
@@ -2628,6 +2683,8 @@ UI优化特性:
             else:
                 new_index = (current_index + 1) % len(widgets)
             widgets[new_index].focus_set()
+            return "break"  # 阻止事件传播
+        return None
 
     def cleanup(self):
         """清理资源，防止内存泄漏"""
