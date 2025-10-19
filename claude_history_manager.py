@@ -2051,8 +2051,8 @@ class ClaudeHistoryGUI:
             # 延迟显示tooltip（避免鼠标快速移动时频繁显示）
             self.tooltip_job = self.root.after(500, lambda: self._show_tooltip(event, full_note))
 
-        except Exception as e:
-            print(f"处理tooltip时出错: {e}")
+        except Exception:
+            pass  # 静默处理异常，避免关闭时的错误
 
     def _show_tooltip(self, event, text):
         """显示tooltip"""
@@ -2082,8 +2082,8 @@ class ClaudeHistoryGUI:
             # 确保tooltip在最前面
             self.tooltip.lift()
 
-        except Exception as e:
-            print(f"显示tooltip时出错: {e}")
+        except Exception:
+            pass  # 静默处理异常，避免关闭时的错误
 
     def _hide_tooltip(self, event=None):
         """隐藏tooltip"""
@@ -2356,10 +2356,13 @@ class ClaudeHistoryGUI:
         """窗口关闭事件处理"""
         try:
             self.cleanup()
+        except Exception:
+            pass  # 静默处理异常，避免关闭时的错误
+
+        try:
             self.root.destroy()
-        except Exception as e:
-            print(f"清理资源时出错: {e}")
-            self.root.destroy()
+        except Exception:
+            pass  # 静默处理异常，避免关闭时的错误
 
     def _show_about(self):
         """显示关于信息"""
@@ -2633,10 +2636,17 @@ UI优化特性:
             self._sort_block_timer = None
 
         # 清理tooltip相关资源
-        self._hide_tooltip()
-        if self.tooltip_job:
-            self.root.after_cancel(self.tooltip_job)
-            self.tooltip_job = None
+        try:
+            self._hide_tooltip()
+        except:
+            pass
+
+        try:
+            if self.tooltip_job:
+                self.root.after_cancel(self.tooltip_job)
+                self.tooltip_job = None
+        except:
+            pass
 
     def run(self):
         """运行应用"""
