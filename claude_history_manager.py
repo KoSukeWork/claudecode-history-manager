@@ -647,6 +647,10 @@ class ClaudeHistoryGUI:
         self._file_analysis_cache = {}
         self._file_cache_max_size = 100
 
+        # 备注功能相关
+        self._conversation_notes = {}
+        self._notes_file_path = self.projects_path / ".conversation_notes.json"
+
         # 创建组件
         self.conversation_viewer = ConversationViewer(self)
 
@@ -660,6 +664,7 @@ class ClaudeHistoryGUI:
         self._setup_keyboard_shortcuts()
 
         # 加载数据
+        self._load_conversation_notes()
         self._load_projects()
 
     def _create_widgets(self):
@@ -738,7 +743,7 @@ class ClaudeHistoryGUI:
         tree_scrollbar = ttk.Scrollbar(tree_frame)
         tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        columns = ("文件名", "修改时间", "消息数", "Token", "大小")
+        columns = ("文件名", "修改时间", "消息数", "Token", "大小", "备注")
         self.conversation_tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                                            yscrollcommand=tree_scrollbar.set)
         self.conversation_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -750,18 +755,28 @@ class ClaudeHistoryGUI:
         self.conversation_tree.heading("消息数", text="消息数", command=lambda: self._sort_conversations("消息数"))
         self.conversation_tree.heading("Token", text="Token", command=lambda: self._sort_conversations("Token"))
         self.conversation_tree.heading("大小", text="大小", command=lambda: self._sort_conversations("大小"))
+        self.conversation_tree.heading("备注", text="备注", command=lambda: self._sort_conversations("备注"))
 
         # 设置列宽
-        self.conversation_tree.column("文件名", width=220)
-        self.conversation_tree.column("修改时间", width=140)
+        self.conversation_tree.column("文件名", width=200)
+        self.conversation_tree.column("修改时间", width=130)
         self.conversation_tree.column("消息数", width=70)
         self.conversation_tree.column("Token", width=80)
         self.conversation_tree.column("大小", width=70)
+        self.conversation_tree.column("备注", width=150)
 
         # 绑定选择事件 - 点击即刷新
         self.conversation_tree.bind('<<TreeviewSelect>>', self._on_conversation_select)
         self.conversation_tree.bind('<Double-1>', self._on_conversation_double_click)
         self.conversation_tree.bind('<Button-3>', self._show_context_menu)
+
+        # 绑定鼠标悬停事件显示完整备注
+        self.conversation_tree.bind('<Motion>', self._on_tree_motion)
+        self.conversation_tree.bind('<Leave>', self._hide_tooltip)
+
+        # Tooltip相关
+        self.tooltip = None
+        self.tooltip_job = None
 
         # 分页控制面板
         pagination_frame = ttk.Frame(list_frame)
@@ -806,6 +821,8 @@ class ClaudeHistoryGUI:
 
         # 右键菜单
         self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="编辑备注", command=self._edit_conversation_note)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="删除对话", command=self._delete_conversation)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="导出为Markdown", command=self._export_conversation_markdown)
@@ -1225,6 +1242,11 @@ class ClaudeHistoryGUI:
             token_count = conv.get('total_tokens', 0)
             token_str = self.token_calculator.format_tokens(token_count) if token_count > 0 else "未知"
 
+            # 获取对话备注
+            note = self._get_conversation_note(conv['file_path'])
+            # 限制显示长度
+            display_note = note[:30] + "..." if len(note) > 30 else note
+
             # 如果是搜索结果，添加匹配数量标识
             if 'matches' in conv:
                 display_name = f"🔍 {conv['file_name']} ({len(conv['matches'])} 匹配)"
@@ -1237,7 +1259,8 @@ class ClaudeHistoryGUI:
                                            conv['modified_time'].strftime("%Y-%m-%d %H:%M:%S"),
                                            conv['message_count'],
                                            token_str,
-                                           self._format_file_size(conv['file_size'])
+                                           self._format_file_size(conv['file_size']),
+                                           display_note
                                        ))
 
         # 重新绑定选择事件
@@ -1278,6 +1301,8 @@ class ClaudeHistoryGUI:
                 self.filtered_conversations.sort(key=lambda x: x.get('total_tokens', 0), reverse=self.sort_reverse)
             elif column == "大小":
                 self.filtered_conversations.sort(key=lambda x: x['file_size'], reverse=self.sort_reverse)
+            elif column == "备注":
+                self.filtered_conversations.sort(key=lambda x: self._get_conversation_note(x['file_path']), reverse=self.sort_reverse)
 
             # 重置到第一页
             self.current_page = 1
@@ -1519,6 +1544,17 @@ class ClaudeHistoryGUI:
         matches = []
 
         try:
+            # 首先检查备注
+            note = self._get_conversation_note(conv['file_path'])
+            if note and pattern.search(note):
+                matches.append({
+                    'line_number': 0,
+                    'field_name': 'note',
+                    'message_type': 'note_match',
+                    'timestamp': None,
+                    'preview': False
+                })
+
             # 先检查预览文本，如果预览文本匹配则直接返回
             first_user_msg = conv.get('first_user_msg', '')
             summary = conv.get('summary', '')
@@ -1790,6 +1826,117 @@ class ClaudeHistoryGUI:
         except Exception as e:
             messagebox.showerror("错误", f"删除失败: {e}")
 
+    def _load_conversation_notes(self):
+        """加载对话备注数据"""
+        try:
+            if self._notes_file_path.exists():
+                with open(self._notes_file_path, 'r', encoding='utf-8') as f:
+                    self._conversation_notes = json.load(f)
+            else:
+                self._conversation_notes = {}
+        except Exception as e:
+            print(f"加载备注数据失败: {e}")
+            self._conversation_notes = {}
+
+    def _save_conversation_notes(self):
+        """保存对话备注数据"""
+        try:
+            # 确保目录存在
+            self._notes_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(self._notes_file_path, 'w', encoding='utf-8') as f:
+                json.dump(self._conversation_notes, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存备注数据失败: {e}")
+
+    def _get_conversation_note(self, file_path: str) -> str:
+        """获取对话备注"""
+        # 使用相对路径作为键
+        try:
+            rel_path = str(Path(file_path).relative_to(self.projects_path))
+        except ValueError:
+            rel_path = file_path
+
+        return self._conversation_notes.get(rel_path, "")
+
+    def _set_conversation_note(self, file_path: str, note: str):
+        """设置对话备注"""
+        # 使用相对路径作为键
+        try:
+            rel_path = str(Path(file_path).relative_to(self.projects_path))
+        except ValueError:
+            rel_path = file_path
+
+        if note.strip():
+            self._conversation_notes[rel_path] = note.strip()
+        else:
+            # 如果备注为空，删除该条记录
+            self._conversation_notes.pop(rel_path, None)
+
+        self._save_conversation_notes()
+
+    def _edit_conversation_note(self):
+        """编辑对话备注"""
+        conv = self._get_selected_conversation()
+        if not conv:
+            return
+
+        current_note = self._get_conversation_note(conv['file_path'])
+
+        # 创建备注编辑对话框
+        dialog = tk.Toplevel(self.root)
+        dialog.title("编辑对话备注")
+        dialog.geometry("500x300")
+        dialog.resizable(True, True)
+
+        # 使对话框居中
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # 备注输入框
+        ttk.Label(dialog, text=f"对话文件: {conv['file_name']}", font=("Arial", 10, "bold")).pack(pady=10)
+
+        note_frame = ttk.Frame(dialog)
+        note_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        note_text = tk.Text(note_frame, wrap=tk.WORD, height=10)
+        note_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(note_frame, orient=tk.VERTICAL, command=note_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        note_text.config(yscrollcommand=scrollbar.set)
+
+        # 设置当前备注
+        note_text.insert(tk.END, current_note)
+        note_text.focus_set()
+
+        # 按钮框架
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        def save_note():
+            new_note = note_text.get(1.0, tk.END).strip()
+            self._set_conversation_note(conv['file_path'], new_note)
+
+            # 更新对话列表显示
+            self._update_conversation_list()
+
+            messagebox.showinfo("成功", "备注已保存")
+            dialog.destroy()
+
+        def cancel_edit():
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="保存", command=save_note).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="取消", command=cancel_edit).pack(side=tk.RIGHT)
+
+        # 绑定键盘快捷键
+        dialog.bind('<Control-s>', lambda e: save_note())
+        dialog.bind('<Escape>', lambda e: cancel_edit())
+
+        # 等待对话框关闭
+        dialog.wait_window()
+
     def _cleanup_deleted_conversation_cache(self, file_path: str):
         """清理已删除对话的相关缓存"""
         try:
@@ -1817,6 +1964,9 @@ class ClaudeHistoryGUI:
             for key in search_cache_keys_to_remove:
                 del self._search_cache[key]
 
+            # 清理备注数据
+            self._set_conversation_note(file_path, "")
+
             # 清理token计算器中的消息缓存
             if hasattr(self.token_calculator, '_message_token_cache'):
                 token_cache_keys_to_remove = []
@@ -1833,6 +1983,123 @@ class ClaudeHistoryGUI:
 
         except Exception as e:
             print(f"清理缓存时出错: {e}")
+
+    def _on_tree_motion(self, event):
+        """处理鼠标在Treeview上移动的事件"""
+        # 取消之前的tooltip任务
+        if self.tooltip_job:
+            self.root.after_cancel(self.tooltip_job)
+            self.tooltip_job = None
+
+        # 隐藏当前tooltip
+        self._hide_tooltip()
+
+        # 获取鼠标位置的项目和列
+        item = self.conversation_tree.identify_row(event.y)
+        column = self.conversation_tree.identify_column(event.x)
+
+        if not item:
+            return
+
+        # 获取列索引（#1对应第一列，#6对应备注列）
+        try:
+            column_index = int(column[1:]) - 1
+        except (ValueError, IndexError):
+            return
+
+        # 只处理备注列（第5列，索引为5）
+        if column_index != 5:
+            return
+
+        # 获取对应对话的完整备注
+        try:
+            item_values = self.conversation_tree.item(item, 'values')
+
+            if not item_values or len(item_values) <= 5:
+                return
+
+            display_note = item_values[5]  # 备注列（第6个值，索引5）
+
+            if not display_note or display_note.strip() == "":
+                return
+
+            # 获取完整备注
+            # 通过文件名找到对应的对话
+            display_name = item_values[0]
+            if display_name.startswith('🔍 '):
+                file_name = display_name.split(' (')[0][2:]
+            else:
+                file_name = display_name
+
+            # 找到对应的对话
+            full_note = ""
+            for conv in self.current_conversations:
+                if conv['file_name'] == file_name:
+                    full_note = self._get_conversation_note(conv['file_path'])
+                    break
+
+            # 如果没有完整备注，则不显示tooltip
+            if not full_note or full_note.strip() == "":
+                return
+
+            # 检查是否需要显示tooltip（长度超过15字符）
+            should_show = len(display_note) > 15 or display_note.endswith("...")
+
+            if not should_show:
+                return
+
+            # 延迟显示tooltip（避免鼠标快速移动时频繁显示）
+            self.tooltip_job = self.root.after(500, lambda: self._show_tooltip(event, full_note))
+
+        except Exception as e:
+            print(f"处理tooltip时出错: {e}")
+
+    def _show_tooltip(self, event, text):
+        """显示tooltip"""
+        try:
+            # 创建tooltip窗口
+            self.tooltip = tk.Toplevel(self.root)
+            self.tooltip.wm_overrideredirect(True)  # 无边框
+            self.tooltip.wm_geometry("+%d+%d" % (event.x_root + 10, event.y_root + 10))
+
+            # 设置背景色和边框
+            self.tooltip.configure(bg="#ffffe0")  # 浅黄色背景
+
+            # 创建标签显示文本
+            label = tk.Label(
+                self.tooltip,
+                text=text,
+                bg="#ffffe0",
+                fg="#000000",
+                font=("Arial", 9),
+                justify=tk.LEFT,
+                wraplength=300,  # 最大宽度300像素
+                padx=5,
+                pady=3
+            )
+            label.pack()
+
+            # 确保tooltip在最前面
+            self.tooltip.lift()
+
+        except Exception as e:
+            print(f"显示tooltip时出错: {e}")
+
+    def _hide_tooltip(self, event=None):
+        """隐藏tooltip"""
+        if self.tooltip:
+            try:
+                self.tooltip.destroy()
+            except:
+                pass
+            self.tooltip = None
+
+        if self.tooltip_job:
+            try:
+                self.root.after_cancel(self.tooltip_job)
+            except:
+                pass
+            self.tooltip_job = None
 
     def _export_conversation_markdown(self):
         """导出对话为Markdown"""
@@ -2276,6 +2543,10 @@ UI优化特性:
         self.root.bind('<Control-r>', lambda e: self._delete_conversation())
         self.root.bind('<Control-R>', lambda e: self._delete_conversation())
 
+        # Ctrl+N - 编辑备注
+        self.root.bind('<Control-n>', lambda e: self._edit_conversation_note())
+        self.root.bind('<Control-N>', lambda e: self._edit_conversation_note())
+
         # Ctrl+E - 导出当前对话
         self.root.bind('<Control-e>', lambda e: self._export_current_markdown())
         self.root.bind('<Control-E>', lambda e: self._export_current_markdown())
@@ -2360,6 +2631,12 @@ UI优化特性:
         if hasattr(self, '_sort_block_timer') and self._sort_block_timer:
             self.root.after_cancel(self._sort_block_timer)
             self._sort_block_timer = None
+
+        # 清理tooltip相关资源
+        self._hide_tooltip()
+        if self.tooltip_job:
+            self.root.after_cancel(self.tooltip_job)
+            self.tooltip_job = None
 
     def run(self):
         """运行应用"""
